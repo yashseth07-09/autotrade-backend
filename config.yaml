@@ -1,0 +1,104 @@
+runtime:
+  data_dir: ./data
+  snapshot_file: latest_snapshot.json
+  events_file: events.jsonl
+  trades_db: trades.sqlite
+  state_resume_file: state_resume.json
+  command_queue_file: command_queue.jsonl
+  loop_interval_seconds: 10
+  snapshot_interval_seconds: 2
+  state_persist_interval_s: 2
+  dry_run: true
+
+exchange:
+  provider: COINDCX_FUTURES
+  base_url: https://api.coindcx.com
+  public_base_url: https://public.coindcx.com
+  api_key_env: COINDCX_API_KEY
+  api_secret_env: COINDCX_API_SECRET
+  margin_currency: USDT   # USDT or INR (CoinDCX futures margin mode)
+  default_leverage: 3
+  auth_timeout_ms: 10000
+  timeout_seconds: 10
+  rate_limit_backoff_seconds: 2
+  use_btc_macro: false
+  btc_macro_provider: BINANCE_FUTURES
+  btc_macro_base_url: https://fapi.binance.com
+  btc_macro_oi_enabled: true
+  btc_macro_liquidity_enabled: true
+
+strategy:
+  # Use exact CoinDCX futures pairs (preferred) or underlying tickers (resolver will map).
+  symbols:
+    - B-ETH_USDT
+    - B-SOL_USDT
+    - B-BNB_USDT
+    - B-XRP_USDT
+    - B-DOGE_USDT
+    - B-ADA_USDT
+    - B-LINK_USDT
+    - B-AVAX_USDT
+    - B-LTC_USDT
+    - B-MATIC_USDT
+  watchlist_replace:
+    - B-TRX_USDT
+    - B-DOT_USDT
+    - B-ATOM_USDT
+  watchlist_size: 10
+  watchlist_accept_exact_pairs: true
+  btc_symbol: BTCUSDT
+  risk_per_trade_pct: 0.4
+  account_equity_usdt: 1000
+  max_daily_loss_r: 2.0
+  max_concurrent_trades: 5
+  cooldown_after_consecutive_losses: 3
+  cooldown_minutes: 30
+  reduce_trades_on_btc_neutral: true
+  btc_neutral_trade_multiplier: 0.5
+  aggressive_adds_enabled: true
+  conservative_adds_week1: true
+  partial_take_pct: 0.5
+  break_even_after_partial: true
+  trail_mode: swing
+  min_signal_score: 0.65
+
+  timeframe:
+    bias_tf: 4h
+    signal_tf: 15m
+    exec_tf: 5m
+
+  setup:
+    breakout_lookback_bars: 10
+    breakout_max_atr_distance: 1.0
+    breakout_min_volume_ratio: 1.2
+    breakout_max_extension_from_ema20_atr: 1.5
+    pullback_zone_tolerance_atr: 0.2
+    liquidity_pool_block_distance_pct: 0.3
+
+  indicators:
+    ema_fast: 20
+    ema_slow: 50
+    atr_period: 14
+    oi_slope_lookback: 6
+    volume_ratio_lookback: 20
+    resistance_lookback: 20
+    swing_lookback_5m: 6
+
+risk:
+  default_stop_atr_multiple: 1.2
+  slippage_bps: 5
+  fee_bps_per_side: 4
+
+observer:
+  host: 0.0.0.0
+  port: 8000
+  snapshot_stale_after_seconds: 30
+  event_stream_poll_ms: 250
+  stream_heartbeat_seconds: 5
+  max_trade_rows: 200
+  max_events_limit: 500
+  snapshot_cache_ttl_ms: 350
+  enable_commands: false
+  cors_allowed_origins:
+    - "*"
+  cors_allow_credentials: false

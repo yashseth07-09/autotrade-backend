@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Runtime data
+data/
+*.sqlite
+*.sqlite3
+*.db
+events*.jsonl
+latest_snapshot.json
+state_resume.json
+command_queue.jsonl
+
+# Node / Expo
+mobile/node_modules/
+mobile/.expo/
+mobile/dist/
+mobile/.env
+.env
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
