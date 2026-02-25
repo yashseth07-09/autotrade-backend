@@ -9,6 +9,7 @@ Runs on AWS EC2 (recommended) or locally:
 
 Expo UI runs separately in `autotrade-ui` on your laptop/phone and connects to the observer API.
 
+
 ## Current Local Folder Layout (Already Split)
 
 Your machine now has:
