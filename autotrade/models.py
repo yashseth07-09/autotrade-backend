@@ -30,6 +30,11 @@ class StageRecord(BaseModel):
     ts: str
     symbol: str
     stage: str
+    timeframe: str | None = None
+    side: str | None = None
+    bias_4h: str | None = None
+    rejection_code: str | None = None
+    cycle_id: str | None = None
     rule: str
     expected: str
     actual: Any
@@ -161,6 +166,7 @@ class Snapshot(BaseModel):
     ts: str
     health: dict[str, Any]
     btc_macro: BTCMacroState
+    market_regime: dict[str, Any] = Field(default_factory=dict)
     top_candidates: list[SignalCandidate] = Field(default_factory=list)
     open_positions: list[Position] = Field(default_factory=list)
     risk: RiskMetrics

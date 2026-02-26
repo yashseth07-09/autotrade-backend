@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
+import io
 import json
 import logging
 import os
@@ -12,7 +14,7 @@ from typing import Any, Callable
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 from autotrade.analytics import aggregate_metrics_from_snapshot_and_db, list_trades
 from autotrade.config import AppConfig, load_config
@@ -45,6 +47,22 @@ def _tail_jsonl(path: Path, limit: int = 100) -> list[dict[str, Any]]:
     return out
 
 
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    out: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8", errors="ignore") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                continue
+    return out
+
+
 def _parse_iso(ts_raw: str | None) -> datetime | None:
     if not ts_raw:
         return None
@@ -70,6 +88,8 @@ def _event_matches(
     event_type: str | None = None,
     symbol: str | None = None,
     since: str | None = None,
+    to_ts: str | None = None,
+    side: str | None = None,
 ) -> bool:
     if event_type:
         t = str(event.get("type") or "").upper()
@@ -92,12 +112,151 @@ def _event_matches(
         sym = str(payload.get("symbol") or payload.get("pair") or "")
         if s not in sym.upper():
             return False
+    if side:
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        event_side = str(payload.get("side") or "").upper()
+        if event_side != str(side).upper():
+            return False
     if since:
         since_dt = _parse_iso(since)
         evt_dt = _parse_iso(str(event.get("ts") or ""))
         if since_dt and evt_dt and evt_dt < since_dt:
             return False
+    if to_ts:
+        to_dt = _parse_iso(to_ts)
+        evt_dt = _parse_iso(str(event.get("ts") or ""))
+        if to_dt and evt_dt and evt_dt > to_dt:
+            return False
     return True
+
+
+def _csv_cell(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, (dict, list)):
+        try:
+            return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+        except Exception:
+            return str(value)
+    return str(value)
+
+
+def _regime_csv_cell(value: Any) -> str:
+    if isinstance(value, dict):
+        trend = value.get("trend")
+        return str(trend or _csv_cell(value))
+    return _csv_cell(value)
+
+
+def _audit_price_from_payload(payload: dict[str, Any]) -> Any:
+    if not isinstance(payload, dict):
+        return None
+    meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+    actual = payload.get("actual") if isinstance(payload.get("actual"), dict) else {}
+    for key in ("price",):
+        if key in meta and meta.get(key) is not None:
+            return meta.get(key)
+    for key in ("price", "entry_price", "exit_price"):
+        if key in actual and actual.get(key) is not None:
+            return actual.get(key)
+    return payload.get("price")
+
+
+AUDIT_CSV_COLUMNS = [
+    "ts_utc",
+    "cycle_id",
+    "symbol",
+    "timeframe",
+    "side",
+    "stage",
+    "passed",
+    "rejection_code",
+    "bias_4h",
+    "regime_15m",
+    "regime_5m",
+    "price",
+    "expected",
+    "actual",
+    "delta",
+    "message",
+]
+
+
+def _audit_row_from_event(event: dict[str, Any]) -> dict[str, Any] | None:
+    event_type = str(event.get("type") or "").upper()
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    if event_type == "STAGE":
+        stage = str(payload.get("stage") or "")
+        meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+        return {
+            "ts_utc": str(event.get("ts") or payload.get("ts") or ""),
+            "cycle_id": payload.get("cycle_id") or "",
+            "symbol": payload.get("symbol") or payload.get("pair") or "",
+            "timeframe": payload.get("timeframe") or "",
+            "side": payload.get("side") or "",
+            "stage": stage,
+            "passed": _csv_cell(payload.get("passed")),
+            "rejection_code": payload.get("rejection_code") or "",
+            "bias_4h": payload.get("bias_4h") or "",
+            "regime_15m": _regime_csv_cell(meta.get("regime_15m")),
+            "regime_5m": _regime_csv_cell(meta.get("regime_5m")),
+            "price": _csv_cell(_audit_price_from_payload(payload)),
+            "expected": _csv_cell(payload.get("expected")),
+            "actual": _csv_cell(payload.get("actual")),
+            "delta": _csv_cell(payload.get("delta")),
+            "message": _csv_cell(payload.get("message")),
+        }
+
+    if event_type in {"ENTER", "EXIT"}:
+        return {
+            "ts_utc": str(event.get("ts") or ""),
+            "cycle_id": "",
+            "symbol": payload.get("symbol") or payload.get("pair") or "",
+            "timeframe": "trade",
+            "side": payload.get("side") or "",
+            "stage": event_type.lower(),
+            "passed": "true",
+            "rejection_code": "",
+            "bias_4h": "",
+            "regime_15m": "",
+            "regime_5m": "",
+            "price": _csv_cell(_audit_price_from_payload(payload)),
+            "expected": "",
+            "actual": _csv_cell(payload),
+            "delta": "",
+            "message": _csv_cell(payload.get("message")),
+        }
+    return None
+
+
+def _build_audit_csv(
+    events_path: Path,
+    *,
+    symbol: str | None = None,
+    side: str | None = None,
+    from_ts: str | None = None,
+    to_ts: str | None = None,
+) -> str:
+    raw = _read_jsonl(events_path)
+    rows: list[dict[str, Any]] = []
+    for event in raw:
+        if not _event_matches(event, symbol=symbol, side=side, since=from_ts, to_ts=to_ts):
+            continue
+        row = _audit_row_from_event(event)
+        if row is None:
+            continue
+        rows.append(row)
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=AUDIT_CSV_COLUMNS, extrasaction="ignore", lineterminator="\n")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({k: _csv_cell(row.get(k)) if k not in {"passed"} else row.get(k, "") for k in AUDIT_CSV_COLUMNS})
+    return buf.getvalue()
 
 
 class FileEventBroadcaster:
@@ -293,6 +452,32 @@ class ObserverRuntime:
             "last_http_error_ts": diag.get("last_http_error_ts"),
         }
 
+    async def regime(self) -> dict[str, Any]:
+        wrapper = await self.read_snapshot()
+        snap = wrapper.get("snapshot") or {}
+        return {
+            "ts": snap.get("ts"),
+            "stale": wrapper.get("stale", True),
+            "items": (snap.get("market_regime") or {}) if isinstance(snap, dict) else {},
+        }
+
+    async def audit_export_csv(
+        self,
+        *,
+        symbol: str | None = None,
+        side: str | None = None,
+        from_ts: str | None = None,
+        to_ts: str | None = None,
+    ) -> str:
+        return await asyncio.to_thread(
+            _build_audit_csv,
+            self.paths["events"],
+            symbol=symbol,
+            side=side,
+            from_ts=from_ts,
+            to_ts=to_ts,
+        )
+
 
 def create_app(config_path: str = "config.yaml") -> FastAPI:
     root = Path(__file__).resolve().parent
@@ -361,6 +546,10 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
     async def get_diagnostics() -> JSONResponse:
         return JSONResponse(await runtime.diagnostics())
 
+    @app.get("/regime")
+    async def get_regime() -> JSONResponse:
+        return JSONResponse(await runtime.regime())
+
     @app.get("/health")
     async def get_health() -> JSONResponse:
         snapshot_data = await asyncio.to_thread(_read_json_file, runtime.paths["snapshot"])
@@ -412,6 +601,19 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
         max_limit = min(int(limit), 500, max(1, int(runtime.config.observer.max_events_limit)))
         events = await runtime.tail_events(limit=max_limit, offset=offset, event_type=type, symbol=symbol, since=since)
         return JSONResponse({"items": events, "count": len(events), "limit": max_limit, "offset": offset})
+
+    @app.get("/audit/export")
+    async def get_audit_export(
+        symbol: str | None = Query(None),
+        side: str | None = Query(None),
+        from_ts: str | None = Query(None, alias="from"),
+        to_ts: str | None = Query(None, alias="to"),
+    ) -> PlainTextResponse:
+        csv_text = await runtime.audit_export_csv(symbol=symbol, side=side, from_ts=from_ts, to_ts=to_ts)
+        stamp = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%SZ")
+        filename_parts = ["autotrade_audit", (symbol or "all"), (side or "all"), stamp]
+        headers = {"Content-Disposition": f"attachment; filename=\"{'_'.join(filename_parts)}.csv\""}
+        return PlainTextResponse(csv_text, media_type="text/csv", headers=headers)
 
     @app.websocket("/stream")
     async def stream(websocket: WebSocket) -> None:

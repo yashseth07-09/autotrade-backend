@@ -8,6 +8,7 @@ import signal
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from autotrade.config import AppConfig, load_config
 from autotrade.execution_engine import CoinDCXFuturesBroker, ExecutionEngine
@@ -21,6 +22,8 @@ from autotrade.persistence.state_resume_store import StateResumeStore
 from autotrade.persistence.snapshot_writer import SnapshotWriter
 from autotrade.persistence.trade_store import TradeStore
 from autotrade.position_manager import PositionManager
+from autotrade.regime_engine import compute_regime
+from autotrade.rejection_codes import classify_rejection_code
 from autotrade.risk_engine import RiskEngine
 from autotrade.runtime.command_queue import FileCommandQueue
 from autotrade.runtime.state import RuntimeState
@@ -332,6 +335,148 @@ class BotEngine:
                 {"file": key, "path": str(path), "age_s": round(age_s, 2), "mtime": datetime.fromtimestamp(path.stat().st_mtime, tz=UTC).isoformat()},
             )
 
+    def _current_cycle_id(self) -> str | None:
+        raw = self.state.runtime_meta.get("cycle_id")
+        return str(raw) if raw else None
+
+    @staticmethod
+    def _bias_label(value: str | None) -> str | None:
+        if value is None:
+            return None
+        raw = str(value).upper()
+        return {"BULL": "BULLISH", "BEAR": "BEARISH"}.get(raw, raw)
+
+    def _stage_record(
+        self,
+        *,
+        symbol: str,
+        stage: str,
+        rule: str,
+        expected: str,
+        actual: Any,
+        passed: bool,
+        message: str,
+        side: str | None = None,
+        timeframe: str | None = None,
+        bias_4h: str | None = None,
+        rejection_code: str | None = None,
+        cycle_id: str | None = None,
+        delta: Any = None,
+        meta: dict[str, Any] | None = None,
+    ) -> StageRecord:
+        if not passed and not rejection_code:
+            rejection_code = classify_rejection_code(stage=stage, rule=rule, message=message, actual=actual, meta=meta)
+        return StageRecord(
+            ts=utc_now_iso(),
+            symbol=symbol,
+            stage=stage,
+            timeframe=timeframe,
+            side=side,
+            bias_4h=bias_4h,
+            rejection_code=rejection_code,
+            cycle_id=cycle_id or self._current_cycle_id(),
+            rule=rule,
+            expected=expected,
+            actual=actual,
+            delta=delta,
+            passed=passed,
+            message=message,
+            meta=meta or {},
+        )
+
+    @staticmethod
+    def _spread_pct(bundle: SymbolMarketBundle) -> float | None:
+        try:
+            if not bundle.orderbook.bids or not bundle.orderbook.asks:
+                return None
+            best_bid = float(bundle.orderbook.bids[0][0])
+            best_ask = float(bundle.orderbook.asks[0][0])
+            if best_bid <= 0 or best_ask <= 0 or best_ask < best_bid:
+                return None
+            mid = float(bundle.orderbook.mark_price or bundle.orderbook.ltp or ((best_bid + best_ask) / 2))
+            if mid <= 0:
+                return None
+            return ((best_ask - best_bid) / mid) * 100.0
+        except Exception:
+            return None
+
+    @staticmethod
+    def _entry_eval_context(stages: list[StageRecord], side: str | None) -> dict[str, Any]:
+        if not side:
+            return {}
+        side_u = str(side).upper()
+        for rec in reversed(stages):
+            if str(rec.stage).upper() != "ENTRY_EVAL":
+                continue
+            if str(rec.side or "").upper() != side_u:
+                continue
+            return {
+                "side": rec.side,
+                "bias_4h": rec.bias_4h,
+                "cycle_id": rec.cycle_id,
+                "rejection_code": rec.rejection_code,
+                "message": rec.message,
+                "meta": rec.meta if isinstance(rec.meta, dict) else {},
+            }
+        return {}
+
+    @staticmethod
+    def _audit_meta_from_entry_eval(entry_eval_ctx: dict[str, Any], fallback_price: float | None = None) -> dict[str, Any]:
+        meta = dict(entry_eval_ctx.get("meta") or {})
+        if fallback_price is not None and meta.get("price") is None:
+            meta["price"] = fallback_price
+        out = {}
+        for key in ("price", "regime_15m", "regime_5m", "spread_pct"):
+            if key in meta:
+                out[key] = meta.get(key)
+        return out
+
+    async def _compute_market_regime_panel(self) -> dict[str, Any]:
+        targets = ["BTCUSDT", "ETHUSDT"]
+        out: dict[str, Any] = {}
+        try:
+            await self.instrument_resolver.refresh()
+        except Exception as exc:
+            await self.logger.emit("MARKET_REGIME_ERROR", {"stage": "refresh_instruments", "error": str(exc)})
+            return out
+
+        async def compute_one(token: str) -> tuple[str, dict[str, Any]]:
+            try:
+                matcher = getattr(self.instrument_resolver, "_match_requested_symbol")
+                instr = matcher(token)
+            except Exception:
+                instr = None
+            if instr is None:
+                return token, {
+                    "4h": {"symbol": token, "timeframe": "4h", "trend": "NEUTRAL", "volatility": "LOW_VOL", "structure": "RANGE", "reason": "instrument_not_found"},
+                    "1h": {"symbol": token, "timeframe": "1h", "trend": "NEUTRAL", "volatility": "LOW_VOL", "structure": "RANGE", "reason": "instrument_not_found"},
+                    "15m": {"symbol": token, "timeframe": "15m", "trend": "NEUTRAL", "volatility": "LOW_VOL", "structure": "RANGE", "reason": "instrument_not_found"},
+                }
+
+            pairs = await asyncio.gather(
+                self.market_data.get_candles(instr.pair, "4h", limit=200),
+                self.market_data.get_candles(instr.pair, "1h", limit=200),
+                self.market_data.get_candles(instr.pair, "15m", limit=240),
+                return_exceptions=True,
+            )
+            tf_map = {"4h": pairs[0], "1h": pairs[1], "15m": pairs[2]}
+            token_out: dict[str, Any] = {}
+            for tf, payload in tf_map.items():
+                if isinstance(payload, Exception):
+                    token_out[tf] = {"symbol": token, "timeframe": tf, "trend": "NEUTRAL", "volatility": "LOW_VOL", "structure": "RANGE", "reason": str(payload)}
+                    continue
+                token_out[tf] = compute_regime(token, tf, payload, self.config)
+            return token, token_out
+
+        results = await asyncio.gather(*(compute_one(t) for t in targets), return_exceptions=True)
+        for res in results:
+            if isinstance(res, Exception):
+                await self.logger.emit("MARKET_REGIME_ERROR", {"stage": "compute", "error": str(res)})
+                continue
+            token, payload = res
+            out[token] = payload
+        return out
+
     def _management_context_for_position(self, position: Position) -> dict[str, Any]:
         return {
             "trail_mode": self.config.strategy.trail_mode,
@@ -397,7 +542,7 @@ class BotEngine:
     def _capture_reject_from_stage(self, rec: StageRecord) -> None:
         if rec.passed:
             return
-        if rec.stage not in {"signal_confirmed_15m_close", "setup_candidate_15m", "execution_gate_5m"}:
+        if rec.stage not in {"ENTRY_EVAL", "signal_confirmed_15m_close", "setup_candidate_15m", "execution_gate_5m"}:
             return
         reason = rec.message or str(rec.actual.get("message") if isinstance(rec.actual, dict) else "")
         self.state.add_top_reject(
@@ -405,6 +550,10 @@ class BotEngine:
                 "symbol": rec.symbol,
                 "stage": rec.stage,
                 "reason": reason,
+                "rejection_code": rec.rejection_code,
+                "side": rec.side,
+                "timeframe": rec.timeframe,
+                "cycle_id": rec.cycle_id,
                 "actual": rec.actual,
                 "passed": rec.passed,
             }
@@ -458,7 +607,7 @@ class BotEngine:
                     self.state.health["last_cycle_error"] = str(exc)
                     self.state.runtime_meta["last_cycle_ok"] = False
                     self.state.runtime_meta["last_cycle_error"] = str(exc)
-                    await self.logger.emit("CYCLE_ERROR", {"error": str(exc)})
+                    await self.logger.emit("CYCLE_ERROR", {"error": str(exc), "cycle_id": self._current_cycle_id()})
                 self.state.health["last_cycle_at"] = utc_now_iso()
                 cycle_elapsed = asyncio.get_running_loop().time() - start
                 self.state.runtime_meta["cycle_ms"] = round(cycle_elapsed * 1000.0, 2)
@@ -476,6 +625,8 @@ class BotEngine:
         self._shutdown.set()
 
     async def run_cycle(self) -> None:
+        cycle_id = f"cycle-{datetime.now(tz=UTC).strftime('%Y%m%dT%H%M%S')}-{uuid4().hex[:8]}"
+        self.state.runtime_meta["cycle_id"] = cycle_id
         instruments = await self.instrument_resolver.resolve_watchlist(
             requested=self.config.strategy.symbols,
             replacements=self.config.strategy.watchlist_replace,
@@ -502,18 +653,23 @@ class BotEngine:
                 await self.logger.emit("MARKET_DATA_ERROR", {"error": str(exc)})
 
         bundle_by_pair = {b.instrument.pair: b for b in bundles}
+        try:
+            self.state.market_regime = await self._compute_market_regime_panel()
+        except Exception as exc:
+            await self.logger.emit("MARKET_REGIME_ERROR", {"stage": "panel", "error": str(exc), "cycle_id": cycle_id})
         for bundle in bundles:
-            await self._process_symbol_bundle(bundle, btc_macro)
+            await self._process_symbol_bundle(bundle, btc_macro, cycle_id=cycle_id)
 
-        await self._manage_positions(bundle_by_pair, btc_macro)
+        await self._manage_positions(bundle_by_pair, btc_macro, cycle_id=cycle_id)
 
         if self.config.observer.enable_commands:
             # Future phase: command polling and risk/idempotency validation.
             _ = self.command_queue  # keep interface wired without execution.
 
-    async def _process_symbol_bundle(self, bundle: SymbolMarketBundle, btc_macro: BTCMacroState) -> None:
+    async def _process_symbol_bundle(self, bundle: SymbolMarketBundle, btc_macro: BTCMacroState, *, cycle_id: str | None = None) -> None:
         ltp = bundle.orderbook.ltp
         mark = bundle.orderbook.mark_price
+        spread_pct = self._spread_pct(bundle)
         liq_long = self.market_data.liquidity_block_distance_pct(bundle.orderbook, (mark or ltp or 0.0), "LONG")
         liq_short = self.market_data.liquidity_block_distance_pct(bundle.orderbook, (mark or ltp or 0.0), "SHORT")
 
@@ -527,6 +683,8 @@ class BotEngine:
             liquidity_distance_long_pct=liq_long,
             liquidity_distance_short_pct=liq_short,
             btc_macro=btc_macro,
+            spread_pct=spread_pct,
+            cycle_id=cycle_id or self._current_cycle_id(),
         )
         for rec in stages:
             await self.logger.stage(rec)
@@ -536,6 +694,11 @@ class BotEngine:
             self.state.clear_signal(bundle.instrument.pair)
             return
 
+        entry_eval_ctx = self._entry_eval_context(stages, candidate.side)
+        audit_bias = entry_eval_ctx.get("bias_4h") or self._bias_label(btc_macro.bias_4h)
+        audit_meta = self._audit_meta_from_entry_eval(entry_eval_ctx, fallback_price=(mark or ltp))
+        audit_meta.setdefault("spread_pct", spread_pct)
+
         self.state.set_signal(candidate)
         if candidate.execution_gate_failed:
             return
@@ -544,8 +707,7 @@ class BotEngine:
 
         if any(p.pair == candidate.pair and p.status != "CLOSED" for p in self.state.positions.values()):
             await self.logger.stage(
-                StageRecord(
-                    ts=utc_now_iso(),
+                self._stage_record(
                     symbol=candidate.pair,
                     stage="entered",
                     rule="skip_duplicate_pair_position",
@@ -553,6 +715,12 @@ class BotEngine:
                     actual={"pair": candidate.pair},
                     passed=False,
                     message="position_already_open_for_pair",
+                    side=candidate.side,
+                    timeframe="trade",
+                    bias_4h=audit_bias,
+                    rejection_code="ALREADY_IN_POSITION",
+                    cycle_id=cycle_id,
+                    meta=audit_meta,
                 )
             )
             return
@@ -564,9 +732,16 @@ class BotEngine:
         metrics = self.risk_engine.current_metrics(open_positions=len([p for p in self.state.positions.values() if p.status != "CLOSED"]))
         self.state.risk_metrics = metrics
         if not metrics.can_trade:
+            block_reason = str(metrics.trade_block_reason or "")
+            reject_code = (
+                "DAILY_LOSS_LIMIT"
+                if "daily_loss" in block_reason
+                else "COOLDOWN_ACTIVE"
+                if "cooldown" in block_reason
+                else "EXECUTION_GATE_BLOCK"
+            )
             await self.logger.stage(
-                StageRecord(
-                    ts=utc_now_iso(),
+                self._stage_record(
                     symbol=candidate.pair,
                     stage="entered",
                     rule="risk_gate",
@@ -574,6 +749,12 @@ class BotEngine:
                     actual={"can_trade": metrics.can_trade, "reason": metrics.trade_block_reason},
                     passed=False,
                     message="risk_gate_blocked",
+                    side=candidate.side,
+                    timeframe="trade",
+                    bias_4h=audit_bias,
+                    rejection_code=reject_code,
+                    cycle_id=cycle_id,
+                    meta=audit_meta,
                 )
             )
             return
@@ -589,8 +770,7 @@ class BotEngine:
         )
         if not size_decision.allowed or not size_decision.size_qty or not size_decision.leverage:
             await self.logger.stage(
-                StageRecord(
-                    ts=utc_now_iso(),
+                self._stage_record(
                     symbol=candidate.pair,
                     stage="entered",
                     rule="risk_position_sizing",
@@ -598,6 +778,12 @@ class BotEngine:
                     actual={"allowed": size_decision.allowed, "reason": size_decision.reason},
                     passed=False,
                     message="position_size_rejected",
+                    side=candidate.side,
+                    timeframe="trade",
+                    bias_4h=audit_bias,
+                    rejection_code="EXECUTION_GATE_BLOCK",
+                    cycle_id=cycle_id,
+                    meta=audit_meta,
                 )
             )
             return
@@ -605,8 +791,7 @@ class BotEngine:
         qty = _quantize(size_decision.size_qty, bundle.instrument.quantity_increment)
         if bundle.instrument.min_quantity and qty < bundle.instrument.min_quantity:
             await self.logger.stage(
-                StageRecord(
-                    ts=utc_now_iso(),
+                self._stage_record(
                     symbol=candidate.pair,
                     stage="entered",
                     rule="instrument_min_qty",
@@ -614,6 +799,12 @@ class BotEngine:
                     actual={"qty": qty},
                     passed=False,
                     message="qty_below_min_instrument_limit",
+                    side=candidate.side,
+                    timeframe="trade",
+                    bias_4h=audit_bias,
+                    rejection_code="EXECUTION_GATE_BLOCK",
+                    cycle_id=cycle_id,
+                    meta=audit_meta,
                 )
             )
             return
@@ -621,8 +812,7 @@ class BotEngine:
             qty = _quantize(bundle.instrument.max_quantity, bundle.instrument.quantity_increment)
         if bundle.instrument.min_trade_size and (qty * candidate.entry_price) < bundle.instrument.min_trade_size:
             await self.logger.stage(
-                StageRecord(
-                    ts=utc_now_iso(),
+                self._stage_record(
                     symbol=candidate.pair,
                     stage="entered",
                     rule="instrument_min_notional",
@@ -630,6 +820,12 @@ class BotEngine:
                     actual={"qty": qty, "entry_price": candidate.entry_price, "notional": qty * candidate.entry_price},
                     passed=False,
                     message="notional_below_min_instrument_limit",
+                    side=candidate.side,
+                    timeframe="trade",
+                    bias_4h=audit_bias,
+                    rejection_code="EXECUTION_GATE_BLOCK",
+                    cycle_id=cycle_id,
+                    meta=audit_meta,
                 )
             )
             return
@@ -642,12 +838,20 @@ class BotEngine:
         self._executed_signal_keys.add(signal_key)
         pos = result.position
         self.state.upsert_position(pos)
+        pos.notes.setdefault("audit", {})
+        pos.notes["audit"].update(
+            {
+                "cycle_id": cycle_id or self._current_cycle_id(),
+                "bias_4h": audit_bias,
+                "side": candidate.side,
+                **audit_meta,
+            }
+        )
         pos.notes["management_context"] = self._management_context_for_position(pos)
         await self.trade_store.upsert_open_position(pos)
         await self.trade_store.record_trade_event(pos.id, "ENTER", result.order_payload)
         await self.logger.stage(
-            StageRecord(
-                ts=utc_now_iso(),
+            self._stage_record(
                 symbol=candidate.pair,
                 stage="entered",
                 rule="execution_gate + risk + broker",
@@ -655,10 +859,15 @@ class BotEngine:
                 actual={"qty": qty, "entry_price": pos.entry_price, "leverage": pos.leverage, "margin_currency": pos.margin_currency},
                 passed=True,
                 message="position_opened",
+                side=candidate.side,
+                timeframe="trade",
+                bias_4h=audit_bias,
+                cycle_id=cycle_id,
+                meta=audit_meta,
             )
         )
 
-    async def _manage_positions(self, bundles: dict[str, SymbolMarketBundle], btc_macro: BTCMacroState) -> None:
+    async def _manage_positions(self, bundles: dict[str, SymbolMarketBundle], btc_macro: BTCMacroState, *, cycle_id: str | None = None) -> None:
         unrealized = 0.0
         for position in list(self.state.positions.values()):
             if position.status == "CLOSED":
@@ -774,9 +983,14 @@ class BotEngine:
                     else:
                         position.notes["management_context"] = self._management_context_for_position(position)
                         await self.trade_store.upsert_open_position(position)
+                    audit_ctx = dict(position.notes.get("audit") or {})
+                    exit_meta = {
+                        "price": (audit_ctx.get("price") if audit_ctx.get("price") is not None else d.exit_price),
+                        "regime_15m": audit_ctx.get("regime_15m"),
+                        "regime_5m": audit_ctx.get("regime_5m"),
+                    }
                     await self.logger.stage(
-                        StageRecord(
-                            ts=utc_now_iso(),
+                        self._stage_record(
                             symbol=position.pair,
                             stage="exit",
                             rule="stop/target/macro/management",
@@ -784,6 +998,11 @@ class BotEngine:
                             actual={"price": d.exit_price, "qty": exit_qty, "pnl_usdt": position.pnl_usdt, "pnl_r": position.pnl_r},
                             passed=True,
                             message=d.message,
+                            side=position.side,
+                            timeframe="trade",
+                            bias_4h=(audit_ctx.get("bias_4h") or self._bias_label(btc_macro.bias_4h)),
+                            cycle_id=(audit_ctx.get("cycle_id") or cycle_id),
+                            meta=exit_meta,
                         )
                     )
 

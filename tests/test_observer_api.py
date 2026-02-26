@@ -18,6 +18,18 @@ def _write_sample_files(root: Path, data_dir: Path) -> None:
         "health": {"bot_running": True, "last_cycle_ok": True, "cycle_errors": 0},
         "runtime": {"cycle_ms": 321.0, "dry_run": True, "last_cycle_ok": True, "last_cycle_error": None},
         "btc_macro": {"bias_4h": "NEUTRAL", "enabled": False},
+        "market_regime": {
+            "BTCUSDT": {
+                "4h": {"trend": "BULLISH", "volatility": "NORMAL", "structure": "HH_HL"},
+                "1h": {"trend": "NEUTRAL", "volatility": "LOW_VOL", "structure": "RANGE"},
+                "15m": {"trend": "BEARISH", "volatility": "HIGH_VOL", "structure": "LH_LL"},
+            },
+            "ETHUSDT": {
+                "4h": {"trend": "BULLISH", "volatility": "NORMAL", "structure": "HH_HL"},
+                "1h": {"trend": "BULLISH", "volatility": "NORMAL", "structure": "HH_HL"},
+                "15m": {"trend": "BULLISH", "volatility": "NORMAL", "structure": "HH_HL"},
+            },
+        },
         "top_candidates": [],
         "open_positions": [],
         "risk": {"equity_usdt": 1000, "can_trade": True, "consecutive_losses": 0},
@@ -30,6 +42,44 @@ def _write_sample_files(root: Path, data_dir: Path) -> None:
     }
     (data_dir / "latest_snapshot.json").write_text(json.dumps(snapshot), encoding="utf-8")
     events = [
+        {
+            "ts": datetime.now(tz=UTC).isoformat(),
+            "type": "STAGE",
+            "payload": {
+                "symbol": "B-TRX_USDT",
+                "stage": "ENTRY_EVAL",
+                "timeframe": "15m",
+                "side": "LONG",
+                "bias_4h": "BULLISH",
+                "cycle_id": "cycle-test-1",
+                "passed": False,
+                "rule": "breakout_confirmation",
+                "expected": "close > range_high",
+                "actual": "close below range_high",
+                "delta": -0.12,
+                "message": "breakout_not_confirmed",
+                "rejection_code": "NO_STRUCTURE_BREAK",
+                "meta": {"regime_15m": {"trend": "BEARISH"}, "regime_5m": {"trend": "NEUTRAL"}, "price": 1.23},
+            },
+        },
+        {
+            "ts": datetime.now(tz=UTC).isoformat(),
+            "type": "STAGE",
+            "payload": {
+                "symbol": "B-TRX_USDT",
+                "stage": "entered",
+                "timeframe": "trade",
+                "side": "LONG",
+                "bias_4h": "BULLISH",
+                "cycle_id": "cycle-test-1",
+                "passed": True,
+                "rule": "execution_gate + risk + broker",
+                "expected": "Order accepted and position opened",
+                "actual": {"entry_price": 1.23, "qty": 10},
+                "message": "position_opened",
+                "meta": {"regime_15m": {"trend": "BEARISH"}, "regime_5m": {"trend": "NEUTRAL"}, "price": 1.23},
+            },
+        },
         {"ts": datetime.now(tz=UTC).isoformat(), "type": "STAGE", "payload": {"symbol": "B-TRX_USDT", "stage": "signal_confirmed_15m_close", "passed": False, "message": "score_below_threshold"}},
         {"ts": datetime.now(tz=UTC).isoformat(), "type": "DIAG_HTTP_ERROR", "payload": {"url": "https://api.coindcx.com", "status": 500, "exception": "boom"}},
         {"ts": datetime.now(tz=UTC).isoformat(), "type": "CYCLE_ERROR", "payload": {"error": "x"}},
@@ -104,6 +154,24 @@ class ObserverApiTests(unittest.TestCase):
             self.assertEqual(m["trades_today"], 2)
             self.assertAlmostEqual(m["realized_today"], 2.0, places=6)
             self.assertAlmostEqual(m["win_rate_today"], 50.0, places=6)
+
+            r = client.get("/regime")
+            self.assertEqual(r.status_code, 200)
+            regime = r.json()
+            self.assertIn("BTCUSDT", regime["items"])
+            self.assertEqual(regime["items"]["BTCUSDT"]["4h"]["trend"], "BULLISH")
+
+            r = client.get("/audit/export", params={"symbol": "B-TRX_USDT"})
+            self.assertEqual(r.status_code, 200)
+            self.assertIn("text/csv", r.headers.get("content-type", ""))
+            lines = r.text.strip().splitlines()
+            self.assertGreaterEqual(len(lines), 3)
+            self.assertEqual(
+                lines[0],
+                "ts_utc,cycle_id,symbol,timeframe,side,stage,passed,rejection_code,bias_4h,regime_15m,regime_5m,price,expected,actual,delta,message",
+            )
+            self.assertTrue(any("ENTRY_EVAL" in line for line in lines[1:]))
+            self.assertTrue(any(",entered," in line for line in lines[1:]))
 
 
 if __name__ == "__main__":

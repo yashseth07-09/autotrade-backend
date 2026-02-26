@@ -14,6 +14,7 @@ class RuntimeState:
     config: AppConfig
     session_id: str = field(default_factory=lambda: str(uuid4()))
     btc_macro: BTCMacroState = field(default_factory=BTCMacroState)
+    market_regime: dict[str, Any] = field(default_factory=dict)
     signals: dict[str, SignalCandidate] = field(default_factory=dict)
     positions: dict[str, Position] = field(default_factory=dict)
     health: dict[str, Any] = field(default_factory=lambda: {"bot_running": False, "last_cycle_at": None, "cycle_errors": 0})
@@ -81,6 +82,7 @@ class RuntimeState:
             ts=utc_now_iso(),
             health=self.health,
             btc_macro=self.btc_macro,
+            market_regime=dict(self.market_regime or {}),
             top_candidates=sorted(self.signals.values(), key=lambda s: s.score, reverse=True)[:20],
             open_positions=list(self.positions.values()),
             risk=risk,

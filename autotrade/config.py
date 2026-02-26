@@ -65,6 +65,19 @@ class IndicatorConfig(BaseModel):
     swing_lookback_5m: int = 6
 
 
+class RegimeConfig(BaseModel):
+    ema_fast: int = 20
+    ema_slow: int = 50
+    atr_period: int = 14
+    atr_rank_lookback: int = 80
+    high_vol_percentile: float = 0.75
+    low_vol_percentile: float = 0.25
+    volume_ratio_lookback: int = 20
+    high_vol_ratio: float = 1.5
+    low_vol_ratio: float = 0.75
+    structure_lookback: int = 12
+
+
 class StrategyConfig(BaseModel):
     symbols: list[str] = Field(default_factory=list)
     watchlist_replace: list[str] = Field(default_factory=list)
@@ -88,6 +101,7 @@ class StrategyConfig(BaseModel):
     timeframe: TimeframeConfig = Field(default_factory=TimeframeConfig)
     setup: SetupConfig = Field(default_factory=SetupConfig)
     indicators: IndicatorConfig = Field(default_factory=IndicatorConfig)
+    regime: RegimeConfig = Field(default_factory=RegimeConfig)
 
 
 class RiskConfig(BaseModel):

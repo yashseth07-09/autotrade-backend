@@ -8,6 +8,8 @@ from uuid import uuid4
 from autotrade.config import AppConfig
 from autotrade.indicators import atr, average, ema, slope
 from autotrade.models import BTCMacroState, Bias, Candle, InstrumentInfo, SignalCandidate, StageRecord
+from autotrade.regime_engine import compute_regime
+from autotrade.rejection_codes import classify_rejection_code
 from autotrade.utils import utc_now_iso
 
 
@@ -114,42 +116,130 @@ class StrategyEngine:
         liquidity_distance_long_pct: float | None,
         liquidity_distance_short_pct: float | None,
         btc_macro: BTCMacroState,
+        spread_pct: float | None = None,
+        cycle_id: str | None = None,
     ) -> tuple[SignalCandidate | None, list[StageRecord]]:
         stages: list[StageRecord] = []
+        symbol_label = instrument.underlying or instrument.pair
         bias, bias_meta, bias_ok = self._compute_4h_bias(instrument, candles_4h)
-        stages.append(self._stage(instrument.pair, "bias_4h", "EMA20/EMA50 and structure aligned", bias_meta, bias_ok, bias_meta.get("message", "")))
-        if not bias_ok or bias == "NEUTRAL":
-            return None, stages
+        bias_label = self._bias_label(bias)
+        regime_15m = compute_regime(symbol_label, "15m", candles_15m, self.config)
+        regime_5m = compute_regime(symbol_label, "5m", candles_5m, self.config)
+        stages.append(
+            self._stage(
+                instrument.pair,
+                "bias_4h",
+                "EMA20/EMA50 and structure aligned",
+                bias_meta,
+                bias_ok,
+                bias_meta.get("message", ""),
+                timeframe="4h",
+                bias_4h=bias_label,
+                cycle_id=cycle_id,
+                meta={"regime_15m": regime_15m, "regime_5m": regime_5m},
+            )
+        )
 
-        macro_ok, macro_msg, macro_meta = self._macro_gate(bias, btc_macro)
-        stages.append(self._stage(instrument.pair, "macro_gate", "BTC macro supportive or disabled", macro_meta, macro_ok, macro_msg))
-        if not macro_ok:
-            return None, stages
+        macro_ok = False
+        macro_msg = "macro_gate_skipped_due_to_bias"
+        macro_meta: dict[str, Any] = {"enabled": bool(self.config.exchange.use_btc_macro), "skipped_due_to_bias": True}
+        if bias_ok and bias != "NEUTRAL":
+            macro_ok, macro_msg, macro_meta = self._macro_gate(bias, btc_macro)
+            stages.append(
+                self._stage(
+                    instrument.pair,
+                    "macro_gate",
+                    "BTC macro supportive or disabled",
+                    macro_meta,
+                    macro_ok,
+                    macro_msg,
+                    timeframe="15m",
+                    bias_4h=bias_label,
+                    cycle_id=cycle_id,
+                )
+            )
 
         setup_res = self._evaluate_15m_setups(
             instrument=instrument,
             bias=bias,
+            bias_ok=bias_ok,
+            macro_ok=macro_ok,
+            macro_msg=macro_msg,
             candles_15m=candles_15m,
+            candles_5m=candles_5m,
             ltp=ltp,
             mark_price=mark_price,
             liquidity_distance_long_pct=liquidity_distance_long_pct,
             liquidity_distance_short_pct=liquidity_distance_short_pct,
             btc_macro=btc_macro,
+            spread_pct=spread_pct,
+            bias_label=bias_label,
+            regime_15m=regime_15m,
+            regime_5m=regime_5m,
+            cycle_id=cycle_id,
         )
+        stages.extend(setup_res.get("stages") or [])
         candidate: SignalCandidate | None = setup_res["candidate"]
-        stages.append(self._stage(instrument.pair, "setup_candidate_15m", "Breakout close or pullback continuation", setup_res["meta"], candidate is not None, setup_res["meta"].get("message", "")))
+        stages.append(
+            self._stage(
+                instrument.pair,
+                "setup_candidate_15m",
+                "Breakout close or pullback continuation",
+                setup_res["meta"],
+                candidate is not None,
+                setup_res["meta"].get("message", ""),
+                timeframe="15m",
+                side=(candidate.side if candidate is not None else None),
+                bias_4h=bias_label,
+                cycle_id=cycle_id,
+                rejection_code=(None if candidate is not None else setup_res["meta"].get("rejection_code")),
+                meta={"regime_15m": regime_15m, "regime_5m": regime_5m, "price": mark_price or ltp},
+            )
+        )
+        if not bias_ok or bias == "NEUTRAL" or not macro_ok:
+            return None, stages
         if candidate is None:
             return None, stages
 
         confirmed, confirm_meta = self._signal_confirmed_15m_close(candles_15m, candidate)
-        stages.append(self._stage(instrument.pair, "signal_confirmed_15m_close", f"Closed 15m candle and score >= {self.config.strategy.min_signal_score}", confirm_meta, confirmed, confirm_meta.get("message", "")))
+        stages.append(
+            self._stage(
+                instrument.pair,
+                "signal_confirmed_15m_close",
+                f"Closed 15m candle and score >= {self.config.strategy.min_signal_score}",
+                confirm_meta,
+                confirmed,
+                confirm_meta.get("message", ""),
+                timeframe="15m",
+                side=candidate.side,
+                bias_4h=bias_label,
+                cycle_id=cycle_id,
+                rejection_code=(None if confirmed else classify_rejection_code(stage="signal_confirmed_15m_close", message=confirm_meta.get("message"), actual=confirm_meta)),
+                meta={"regime_15m": regime_15m, "regime_5m": regime_5m, "price": mark_price or ltp},
+            )
+        )
         if not confirmed:
             return None, stages
 
         gate = self.evaluate_execution_gate(candidate, candles_5m)
         candidate.execution_gate_passed = gate.passed
         candidate.execution_gate_failed = gate.failed
-        stages.append(self._stage(instrument.pair, "execution_gate_5m", "Next 1-2 5m bars must not invalidate", gate.meta, gate.passed, gate.message))
+        stages.append(
+            self._stage(
+                instrument.pair,
+                "execution_gate_5m",
+                "Next 1-2 5m bars must not invalidate",
+                gate.meta,
+                gate.passed,
+                gate.message,
+                timeframe="5m",
+                side=candidate.side,
+                bias_4h=bias_label,
+                cycle_id=cycle_id,
+                rejection_code=(None if gate.passed else "EXECUTION_GATE_BLOCK"),
+                meta={"regime_15m": regime_15m, "regime_5m": regime_5m, "price": mark_price or ltp},
+            )
+        )
         return candidate, stages
 
     def evaluate_execution_gate(self, signal: SignalCandidate, candles_5m: list[Candle]) -> ExecutionGateResult:
@@ -212,18 +302,297 @@ class StrategyEngine:
         *,
         instrument: InstrumentInfo,
         bias: Bias,
+        bias_ok: bool,
+        macro_ok: bool,
+        macro_msg: str,
         candles_15m: list[Candle],
+        candles_5m: list[Candle],
         ltp: float | None,
         mark_price: float | None,
         liquidity_distance_long_pct: float | None,
         liquidity_distance_short_pct: float | None,
         btc_macro: BTCMacroState,
+        spread_pct: float | None,
+        bias_label: str,
+        regime_15m: dict[str, Any],
+        regime_5m: dict[str, Any],
+        cycle_id: str | None,
     ) -> dict[str, Any]:
+        long_res = self.evaluate_long_setup(
+            instrument=instrument,
+            bias=bias,
+            bias_ok=bias_ok,
+            macro_ok=macro_ok,
+            macro_msg=macro_msg,
+            candles_15m=candles_15m,
+            candles_5m=candles_5m,
+            ltp=ltp,
+            mark_price=mark_price,
+            liquidity_distance_pct=liquidity_distance_long_pct,
+            btc_macro=btc_macro,
+            spread_pct=spread_pct,
+            bias_label=bias_label,
+            regime_15m=regime_15m,
+            regime_5m=regime_5m,
+        )
+        short_res = self.evaluate_short_setup(
+            instrument=instrument,
+            bias=bias,
+            bias_ok=bias_ok,
+            macro_ok=macro_ok,
+            macro_msg=macro_msg,
+            candles_15m=candles_15m,
+            candles_5m=candles_5m,
+            ltp=ltp,
+            mark_price=mark_price,
+            liquidity_distance_pct=liquidity_distance_short_pct,
+            btc_macro=btc_macro,
+            spread_pct=spread_pct,
+            bias_label=bias_label,
+            regime_15m=regime_15m,
+            regime_5m=regime_5m,
+        )
+
+        side_results = [long_res, short_res]
+        side_stage_records = [
+            self._side_eval_stage(
+                instrument=instrument,
+                cycle_id=cycle_id,
+                bias_label=bias_label,
+                audit=res["audit"],
+            )
+            for res in side_results
+        ]
+
+        candidates = [res["candidate"] for res in side_results if res.get("candidate") is not None]
+        selected = max(candidates, key=lambda c: c.score) if candidates else None
+
+        summaries = [
+            {
+                "side": res["audit"].get("side"),
+                "passed": bool(res["audit"].get("passed")),
+                "rule": res["audit"].get("rule"),
+                "rejection_code": res["audit"].get("rejection_code"),
+                "message": res["audit"].get("message"),
+            }
+            for res in side_results
+        ]
+        selected_side_res = None
+        if selected is not None:
+            selected_side_res = next((res for res in side_results if res.get("candidate") is selected), None)
+        elif bias == "BULL":
+            selected_side_res = long_res
+        elif bias == "BEAR":
+            selected_side_res = short_res
+
+        if selected is None:
+            rejection_code = (
+                (selected_side_res or {}).get("audit", {}).get("rejection_code")
+                or next((res["audit"].get("rejection_code") for res in side_results if res["audit"].get("rejection_code")), None)
+            )
+            message = (
+                (selected_side_res or {}).get("audit", {}).get("message")
+                or next((res["audit"].get("message") for res in side_results if res["audit"].get("message")), "no_valid_15m_setup")
+            )
+            return {
+                "candidate": None,
+                "stages": side_stage_records,
+                "meta": {
+                    "message": message,
+                    "rejection_code": rejection_code or "NO_STRUCTURE_BREAK",
+                    "bias_4h": bias_label,
+                    "side_evaluations": summaries,
+                    "price": mark_price or ltp,
+                    "regime_15m": regime_15m,
+                    "regime_5m": regime_5m,
+                },
+            }
+
+        return {
+            "candidate": selected,
+            "stages": side_stage_records,
+            "meta": {
+                "message": "setup_candidate_selected",
+                "setup": selected.setup,
+                "score": selected.score,
+                "side": selected.side,
+                "bias_4h": bias_label,
+                "side_evaluations": summaries,
+                "price": mark_price or ltp,
+                "regime_15m": regime_15m,
+                "regime_5m": regime_5m,
+            },
+        }
+
+    def evaluate_long_setup(
+        self,
+        *,
+        instrument: InstrumentInfo,
+        bias: Bias,
+        bias_ok: bool,
+        macro_ok: bool,
+        macro_msg: str,
+        candles_15m: list[Candle],
+        candles_5m: list[Candle],
+        ltp: float | None,
+        mark_price: float | None,
+        liquidity_distance_pct: float | None,
+        btc_macro: BTCMacroState,
+        spread_pct: float | None,
+        bias_label: str,
+        regime_15m: dict[str, Any],
+        regime_5m: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self._evaluate_15m_setup_for_side(
+            instrument=instrument,
+            side="LONG",
+            bias=bias,
+            bias_ok=bias_ok,
+            macro_ok=macro_ok,
+            macro_msg=macro_msg,
+            candles_15m=candles_15m,
+            candles_5m=candles_5m,
+            ltp=ltp,
+            mark_price=mark_price,
+            liquidity_distance_pct=liquidity_distance_pct,
+            btc_macro=btc_macro,
+            spread_pct=spread_pct,
+            bias_label=bias_label,
+            regime_15m=regime_15m,
+            regime_5m=regime_5m,
+        )
+
+    def evaluate_short_setup(
+        self,
+        *,
+        instrument: InstrumentInfo,
+        bias: Bias,
+        bias_ok: bool,
+        macro_ok: bool,
+        macro_msg: str,
+        candles_15m: list[Candle],
+        candles_5m: list[Candle],
+        ltp: float | None,
+        mark_price: float | None,
+        liquidity_distance_pct: float | None,
+        btc_macro: BTCMacroState,
+        spread_pct: float | None,
+        bias_label: str,
+        regime_15m: dict[str, Any],
+        regime_5m: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self._evaluate_15m_setup_for_side(
+            instrument=instrument,
+            side="SHORT",
+            bias=bias,
+            bias_ok=bias_ok,
+            macro_ok=macro_ok,
+            macro_msg=macro_msg,
+            candles_15m=candles_15m,
+            candles_5m=candles_5m,
+            ltp=ltp,
+            mark_price=mark_price,
+            liquidity_distance_pct=liquidity_distance_pct,
+            btc_macro=btc_macro,
+            spread_pct=spread_pct,
+            bias_label=bias_label,
+            regime_15m=regime_15m,
+            regime_5m=regime_5m,
+        )
+
+    def _evaluate_15m_setup_for_side(
+        self,
+        *,
+        instrument: InstrumentInfo,
+        side: str,
+        bias: Bias,
+        bias_ok: bool,
+        macro_ok: bool,
+        macro_msg: str,
+        candles_15m: list[Candle],
+        candles_5m: list[Candle],
+        ltp: float | None,
+        mark_price: float | None,
+        liquidity_distance_pct: float | None,
+        btc_macro: BTCMacroState,
+        spread_pct: float | None,
+        bias_label: str,
+        regime_15m: dict[str, Any],
+        regime_5m: dict[str, Any],
+    ) -> dict[str, Any]:
+        _ = candles_5m  # reserved for future side-specific pre-entry checks
+        expected_side = "LONG" if bias == "BULL" else "SHORT" if bias == "BEAR" else None
+        base_meta = {
+            "price": mark_price or ltp,
+            "regime_15m": regime_15m,
+            "regime_5m": regime_5m,
+            "spread_pct": spread_pct,
+            "bias_4h": bias_label,
+        }
+
+        def fail(
+            *,
+            rule: str,
+            expected: str,
+            actual: Any,
+            message: str,
+            rejection_code: str,
+            delta: Any = None,
+            extra_meta: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            return {
+                "candidate": None,
+                "audit": {
+                    "side": side,
+                    "timeframe": "15m",
+                    "passed": False,
+                    "rule": rule,
+                    "expected": expected,
+                    "actual": actual,
+                    "delta": delta,
+                    "message": message,
+                    "rejection_code": rejection_code,
+                    "meta": {**base_meta, **(extra_meta or {})},
+                },
+            }
+
+        if not bias_ok or bias == "NEUTRAL" or expected_side != side:
+            return fail(
+                rule="bias_alignment_4h",
+                expected=f"4H bias aligned for {side}",
+                actual=f"bias_4h={bias_label}",
+                message="no_4h_bias_alignment",
+                rejection_code="NO_4H_BIAS_ALIGNMENT",
+            )
+
+        if not macro_ok:
+            return fail(
+                rule="macro_gate",
+                expected="BTC macro supportive or disabled",
+                actual=macro_msg,
+                message="macro_gate_blocked",
+                rejection_code="EXECUTION_GATE_BLOCK",
+            )
+
         if len(candles_15m) < max(40, self.config.strategy.indicators.ema_slow + 5):
-            return {"candidate": None, "meta": {"message": "insufficient_15m_candles", "count": len(candles_15m)}}
+            return fail(
+                rule="candle_history",
+                expected=f">= {max(40, self.config.strategy.indicators.ema_slow + 5)} candles",
+                actual=f"count={len(candles_15m)}",
+                message="insufficient_15m_candles",
+                rejection_code="NO_STRUCTURE_BREAK",
+            )
+
         idx = self._last_closed_index(candles_15m)
         if idx is None or idx < 20:
-            return {"candidate": None, "meta": {"message": "no_closed_15m_candle"}}
+            return fail(
+                rule="closed_candle",
+                expected="latest 15m candle closed",
+                actual="missing_closed_15m_candle",
+                message="no_closed_15m_candle",
+                rejection_code="NO_STRUCTURE_BREAK",
+            )
+
         bars = candles_15m[: idx + 1]
         last = bars[-1]
         closes = [c.close for c in bars]
@@ -234,30 +603,62 @@ class StrategyEngine:
         es_all = ema(closes, self.config.strategy.indicators.ema_slow)
         atr_all = atr(highs, lows, closes, self.config.strategy.indicators.atr_period)
         if not atr_all:
-            return {"candidate": None, "meta": {"message": "atr_unavailable"}}
-        ef = ef_all[-1]
-        es = es_all[-1]
-        atr_val = max(1e-9, atr_all[-1])
+            return fail(
+                rule="atr_available",
+                expected="ATR available",
+                actual="atr_unavailable",
+                message="atr_unavailable",
+                rejection_code="LOW_ATR",
+            )
+
+        ef = float(ef_all[-1])
+        es = float(es_all[-1])
+        atr_val = max(1e-9, float(atr_all[-1]))
         lookback = self.config.strategy.setup.breakout_lookback_bars
         vol_lb = self.config.strategy.indicators.volume_ratio_lookback
         vol_avg = average(vols[-(vol_lb + 1) : -1]) if len(vols) > vol_lb else average(vols[:-1])
-        vol_ratio = last.volume / max(1e-9, vol_avg) if vol_avg > 0 else 1.0
-        side = "LONG" if bias == "BULL" else "SHORT"
+        vol_ratio = float(last.volume / max(1e-9, vol_avg)) if vol_avg > 0 else 1.0
+        atr_pct = (atr_val / max(1e-9, last.close)) * 100.0
 
-        # Liquidity filter against direction.
-        if side == "LONG" and liquidity_distance_long_pct is not None and liquidity_distance_long_pct <= self.config.strategy.setup.liquidity_pool_block_distance_pct:
-            return {"candidate": None, "meta": {"message": "near_ask_liquidity_wall", "distance_pct": liquidity_distance_long_pct}}
-        if side == "SHORT" and liquidity_distance_short_pct is not None and liquidity_distance_short_pct <= self.config.strategy.setup.liquidity_pool_block_distance_pct:
-            return {"candidate": None, "meta": {"message": "near_bid_liquidity_wall", "distance_pct": liquidity_distance_short_pct}}
+        max_spread_pct = 0.25
+        if spread_pct is not None and spread_pct > max_spread_pct:
+            return fail(
+                rule="spread_filter",
+                expected=f"spread_pct <= {max_spread_pct}",
+                actual=f"spread_pct={round(float(spread_pct), 6)}",
+                message="high_spread",
+                rejection_code="HIGH_SPREAD",
+                delta=round(float(spread_pct) - max_spread_pct, 6),
+                extra_meta={"spread_limit_pct": max_spread_pct, "vol_ratio": round(vol_ratio, 4), "atr_pct": round(atr_pct, 6)},
+            )
+
+        if liquidity_distance_pct is not None and liquidity_distance_pct <= self.config.strategy.setup.liquidity_pool_block_distance_pct:
+            return fail(
+                rule="liquidity_wall_distance",
+                expected=f"distance_pct > {self.config.strategy.setup.liquidity_pool_block_distance_pct}",
+                actual=f"distance_pct={round(float(liquidity_distance_pct), 6)}",
+                message="high_spread" if side == "LONG" else "high_spread",
+                rejection_code="HIGH_SPREAD",
+                delta=round(float(liquidity_distance_pct) - float(self.config.strategy.setup.liquidity_pool_block_distance_pct), 6),
+                extra_meta={"distance_pct": liquidity_distance_pct, "vol_ratio": round(vol_ratio, 4), "atr_pct": round(atr_pct, 6)},
+            )
 
         choices: list[SignalCandidate] = []
-        meta_details: dict[str, Any] = {"vol_ratio": vol_ratio, "side": side}
+        failure_hint: dict[str, Any] | None = None
+        meta_details: dict[str, Any] = {
+            "vol_ratio": round(vol_ratio, 4),
+            "atr_pct": round(atr_pct, 6),
+            "side": side,
+            "ema20": round(ef, 8),
+            "ema50": round(es, 8),
+            "price": round(float(last.close), 8),
+        }
 
-        # Setup A: breakout close.
         if len(bars) >= lookback + 1:
             ref = bars[-(lookback + 1) : -1]
             level = max(c.high for c in ref) if side == "LONG" else min(c.low for c in ref)
             broke = last.close > level if side == "LONG" else last.close < level
+            signed_delta = (last.close - level) if side == "LONG" else (level - last.close)
             breakout_atr = abs(last.close - level) / atr_val
             extended_atr = abs(last.close - ef) / atr_val
             breakout_ok = (
@@ -286,9 +687,45 @@ class StrategyEngine:
                         reasons=["breakout_close", f"breakout_atr={breakout_atr:.2f}", f"vol_ratio={vol_ratio:.2f}"],
                     )
                 )
-                meta_details["breakout_atr"] = breakout_atr
+                meta_details["breakout_atr"] = round(breakout_atr, 4)
+            else:
+                if not broke:
+                    failure_hint = failure_hint or {
+                        "rule": "breakout_confirmation",
+                        "expected": ("close > range_high" if side == "LONG" else "close < range_low"),
+                        "actual": ("close below range_high" if side == "LONG" else "close above range_low"),
+                        "delta": round(signed_delta, 6),
+                        "message": "breakout_not_confirmed",
+                        "rejection_code": "NO_STRUCTURE_BREAK",
+                    }
+                elif vol_ratio < self.config.strategy.setup.breakout_min_volume_ratio:
+                    failure_hint = failure_hint or {
+                        "rule": "volume_confirmation",
+                        "expected": f"vol_ratio >= {self.config.strategy.setup.breakout_min_volume_ratio}",
+                        "actual": f"vol_ratio={round(vol_ratio, 4)}",
+                        "delta": round(vol_ratio - self.config.strategy.setup.breakout_min_volume_ratio, 6),
+                        "message": "low_volume",
+                        "rejection_code": "LOW_VOLUME",
+                    }
+                elif breakout_atr > self.config.strategy.setup.breakout_max_atr_distance:
+                    failure_hint = failure_hint or {
+                        "rule": "breakout_distance_atr",
+                        "expected": f"breakout_atr <= {self.config.strategy.setup.breakout_max_atr_distance}",
+                        "actual": f"breakout_atr={round(breakout_atr, 4)}",
+                        "delta": round(breakout_atr - self.config.strategy.setup.breakout_max_atr_distance, 6),
+                        "message": "no_structure_break",
+                        "rejection_code": "NO_STRUCTURE_BREAK",
+                    }
+                elif extended_atr > self.config.strategy.setup.breakout_max_extension_from_ema20_atr:
+                    failure_hint = failure_hint or {
+                        "rule": "extension_from_ema20_atr",
+                        "expected": f"extension_atr <= {self.config.strategy.setup.breakout_max_extension_from_ema20_atr}",
+                        "actual": f"extension_atr={round(extended_atr, 4)}",
+                        "delta": round(extended_atr - self.config.strategy.setup.breakout_max_extension_from_ema20_atr, 6),
+                        "message": "no_structure_break",
+                        "rejection_code": "NO_STRUCTURE_BREAK",
+                    }
 
-        # Setup B: pullback continuation.
         if len(bars) >= 3:
             prev = bars[-2]
             tol = self.config.strategy.setup.pullback_zone_tolerance_atr * atr_val
@@ -328,11 +765,88 @@ class StrategyEngine:
                     )
                 )
                 meta_details["pullback"] = True
+            elif failure_hint is None:
+                failure_hint = {
+                    "rule": "pullback_continuation",
+                    "expected": "trend + pullback zone + reclaim + body/wick confirmation",
+                    "actual": {
+                        "trend_ok": trend_ok,
+                        "pullback_zone": pullback_zone,
+                        "reclaim": reclaim,
+                        "body_wick_ok": body_wick_ok,
+                    },
+                    "delta": None,
+                    "message": "no_structure_break",
+                    "rejection_code": "NO_STRUCTURE_BREAK",
+                }
 
         if not choices:
-            return {"candidate": None, "meta": {"message": "no_valid_15m_setup", **meta_details}}
+            hint = failure_hint or {
+                "rule": "entry_structure",
+                "expected": "breakout or pullback continuation",
+                "actual": "no_valid_15m_setup",
+                "delta": None,
+                "message": "no_valid_15m_setup",
+                "rejection_code": "NO_STRUCTURE_BREAK",
+            }
+            return fail(
+                rule=str(hint.get("rule") or "entry_structure"),
+                expected=str(hint.get("expected") or "breakout or pullback continuation"),
+                actual=hint.get("actual"),
+                message=str(hint.get("message") or "no_valid_15m_setup"),
+                rejection_code=str(hint.get("rejection_code") or "NO_STRUCTURE_BREAK"),
+                delta=hint.get("delta"),
+                extra_meta=meta_details,
+            )
+
         selected = max(choices, key=lambda c: c.score)
-        return {"candidate": selected, "meta": {"message": "setup_candidate_selected", "setup": selected.setup, "score": selected.score, **meta_details}}
+        selected_reason = "breakout_confirmation" if selected.setup == "BREAKOUT_CLOSE" else "pullback_continuation"
+        return {
+            "candidate": selected,
+            "audit": {
+                "side": side,
+                "timeframe": "15m",
+                "passed": True,
+                "rule": selected_reason,
+                "expected": "all entry filters pass",
+                "actual": f"{selected.setup} selected",
+                "delta": None,
+                "message": "entry_eval_passed",
+                "rejection_code": None,
+                "meta": {
+                    **base_meta,
+                    **meta_details,
+                    "selected_setup": selected.setup,
+                    "score": round(float(selected.score), 4),
+                    "signal_price": round(float(selected.entry_price), 8),
+                },
+            },
+        }
+
+    def _side_eval_stage(
+        self,
+        *,
+        instrument: InstrumentInfo,
+        cycle_id: str | None,
+        bias_label: str,
+        audit: dict[str, Any],
+    ) -> StageRecord:
+        return self._stage(
+            instrument.pair,
+            "ENTRY_EVAL",
+            str(audit.get("expected") or "entry_eval"),
+            audit.get("actual"),
+            bool(audit.get("passed")),
+            str(audit.get("message") or ""),
+            timeframe=str(audit.get("timeframe") or "15m"),
+            side=str(audit.get("side") or ""),
+            bias_4h=bias_label,
+            cycle_id=cycle_id,
+            rule=str(audit.get("rule") or "entry_eval"),
+            delta=audit.get("delta"),
+            rejection_code=(None if audit.get("passed") else audit.get("rejection_code")),
+            meta=(audit.get("meta") if isinstance(audit.get("meta"), dict) else {}),
+        )
 
     def _candidate(
         self,
@@ -370,7 +884,7 @@ class StrategyEngine:
             ltp=ltp,
             signal_candle_close_ms=signal_close_ms,
             reasons=reasons,
-            stage_flow=["bias_4h", "macro_gate", "setup_candidate_15m"],
+            stage_flow=["bias_4h", "macro_gate", "ENTRY_EVAL", "setup_candidate_15m"],
             created_at=utc_now_iso(),
         )
 
@@ -395,15 +909,41 @@ class StrategyEngine:
         return len(candles) - 2 if len(candles) >= 2 else None
 
     @staticmethod
-    def _stage(symbol: str, stage: str, expected: str, actual: dict[str, Any], passed: bool, message: str) -> StageRecord:
+    def _bias_label(bias: Bias) -> str:
+        return {"BULL": "BULLISH", "BEAR": "BEARISH", "NEUTRAL": "NEUTRAL"}.get(str(bias), str(bias))
+
+    @staticmethod
+    def _stage(
+        symbol: str,
+        stage: str,
+        expected: str,
+        actual: Any,
+        passed: bool,
+        message: str,
+        *,
+        rule: str | None = None,
+        timeframe: str | None = None,
+        side: str | None = None,
+        bias_4h: str | None = None,
+        rejection_code: str | None = None,
+        cycle_id: str | None = None,
+        delta: Any = None,
+        meta: dict[str, Any] | None = None,
+    ) -> StageRecord:
         return StageRecord(
             ts=utc_now_iso(),
             symbol=symbol,
             stage=stage,
-            rule=stage,
+            timeframe=timeframe,
+            side=side,
+            bias_4h=bias_4h,
+            rejection_code=rejection_code,
+            cycle_id=cycle_id,
+            rule=rule or stage,
             expected=expected,
             actual=actual,
+            delta=delta,
             passed=passed,
             message=message,
+            meta=meta or {},
         )
-

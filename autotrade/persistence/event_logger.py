@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from autotrade.models import StageRecord
+from autotrade.rejection_codes import classify_rejection_code
 from autotrade.utils import ensure_dir, json_dumps, utc_now_iso
 
 
@@ -53,6 +54,14 @@ class EventLogger:
             self.tail.append(overflow)
 
     async def stage(self, record: StageRecord) -> None:
+        if not record.passed and not record.rejection_code:
+            record.rejection_code = classify_rejection_code(
+                stage=record.stage,
+                rule=record.rule,
+                message=record.message,
+                actual=record.actual,
+                meta=record.meta,
+            )
         await self.emit("STAGE", record.model_dump())
 
     async def _worker(self) -> None:
